@@ -1,6 +1,6 @@
 import socket
 import sys
-import threading
+import multiprocessing
 
 import numpy as np
 
@@ -29,6 +29,9 @@ def send_matrix(n: int, rows: int, address: tuple[str, int]):
     sock.sendall(f"{n}".encode())
     sock.sendall(matrix.tobytes())
 
+    ack = sock.recv(1024).decode()
+    print(ack)
+
     sock.close()
 
 
@@ -36,14 +39,25 @@ def master(n: int):
     nodes = read_config()
     t = len(nodes)
 
-    thread1 = threading.Thread(target=send_matrix, args=(n, n // 2, nodes[0]))
-    thread2 = threading.Thread(target=send_matrix, args=(n, n - n // 2, nodes[t // 2]))
+    rows_per_node = n // t
+    remainder = n % t
 
-    thread1.start()
-    thread2.start()
+    processes = []
+    start_row = 0
 
-    thread1.join()
-    thread2.join()
+    for i in range(t):
+        node_rows = rows_per_node + (1 if i < remainder else 0)
+
+        process = multiprocessing.Process(
+            target=send_matrix, args=(n, node_rows, nodes[i])
+        )
+        processes.append(process)
+        process.start()
+
+        start_row += node_rows
+
+    for process in processes:
+        process.join()
 
 
 def slave(p: int, s: int) -> None:
@@ -70,6 +84,7 @@ def slave(p: int, s: int) -> None:
     matrix = np.frombuffer(buffer).reshape(-1, n)
 
     print(f"Received matrix shape: {matrix.shape}")
+    conn.sendall(f"ack from {socket.gethostname()}, port {p}".encode())
 
     conn.close()
     sock.close()
