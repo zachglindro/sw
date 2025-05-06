@@ -1,4 +1,4 @@
-#define _GNU_SOURCE // For ffs() if needed, though can implement manually
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,976 +9,971 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
-#include <stdint.h> // For uint32_t
-#include <math.h> // For pow(), log2()
+#include <stdint.h>
+#include <math.h>
 #include <errno.h>
 #include <stdbool.h>
 
 // --- Configuration ---
 #define CONFIG_FILE "config.txt"
-#define ACK_MSG "ACK"
+#define ACK_MSG "ACK" // Used only for initial setup maybe? Lab05 sends vectors back.
 #define ACK_LEN 3
-#define MAX_CLIENTS 128 // Sensible maximum for config parsing
+#define MAX_CLIENTS 128
+#define DEFAULT_Q 10 // Default Moving Average Order if not specified
 
 // --- Structures ---
 typedef struct {
-char ip[INET_ADDRSTRLEN];
-int port;
-int id; // Client ID (1-based)
+    char ip[INET_ADDRSTRLEN];
+    int port;
+    int id; // Client ID (1-based)
 } ClientInfo;
 
 typedef struct {
-int n; // Matrix dimension
-int total_clients;
-ClientInfo *clients; // Array of all clients
+    int n; // Matrix dimension (nxn)
+    int q; // Moving average order
+    int total_clients;
+    ClientInfo *clients; // Array of all clients
 } Config;
 
+// Structure to hold matrix data contiguously for easier column handling
 typedef struct {
-int client_sock;
-int *matrix_part;
-uint32_t rows;
-uint32_t cols;
-int target_client_id; // For server -> root client sends
-Config *config; // For server -> root client sends
-} ServerSendThreadArgs;
+    double *data; // Store elements contiguously (row-major or potentially column-major if easier)
+    uint32_t rows;
+    uint32_t cols;
+} Matrix;
 
 typedef struct {
-int parent_sock; // Socket connected to the parent/server
-int client_id;
-int port_to_listen;
-Config *config;
-struct timeval time_before;
-struct timeval time_after;
+    int client_sock;
+    Matrix matrix_part; // Matrix columns to send
+    int target_client_id;
+    Config *config;
+    double *result_vector_part; // Pointer to where the server should store the received result
+    pthread_mutex_t *result_mutex; // To protect writing to the result vector part
+} ServerCommThreadArgs;
+
+typedef struct {
+    int parent_sock; // Socket connected to the parent/server
+    int client_id;
+    int port_to_listen;
+    Config *config;
+    double computation_time; // To store time spent ONLY on MA calculation
 } ClientArgs;
 
 typedef struct {
-int child_id;
-int *matrix_part;
-uint32_t rows;
-uint32_t cols;
-Config *config;
-int *ack_received_flag; // Pointer to a flag indicating if ACK was received
-pthread_mutex_t *ack_mutex; // Mutex to protect the flag
-} ClientSendThreadArgs;
+    int child_id;
+    Matrix matrix_part; // Columns to send to child
+    Config *config;
+    double *received_child_vector; // Pointer to store result vector received FROM child
+    uint32_t *received_child_vector_size; // Pointer to store the size
+    pthread_mutex_t *child_result_mutex; // Protect access to received vector storage
+} ClientCommThreadArgs;
 
 // --- Global Variables ---
-// Use sparingly, prefer passing args. Can be useful for shared data like config.
-// Config config_g; // Decided against global config, pass via args
+// None preferred
 
-// --- Error Handling ---
+// --- Error Handling & Time Helper ---
 void error_exit(const char *msg) {
-perror(msg);
-exit(EXIT_FAILURE);
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-// --- Time Helper ---
 double time_diff(struct timeval *start, struct timeval *end) {
-return (end->tv_sec - start->tv_sec) + (end->tv_usec - start->tv_usec) / 1000000.0;
+    return (end->tv_sec - start->tv_sec) + (end->tv_usec - start->tv_usec) / 1000000.0;
 }
 
-// --- Network Helpers ---
+// --- Matrix Helpers ---
 
-// Sends exactly 'len' bytes from 'buf' to 'sockfd'. Handles partial sends.
-int send_all(int sockfd, const void *buf, size_t len) {
-size_t total = 0;
-ssize_t n;
-const char *ptr = (const char *)buf;
-
-while (total < len) {
-    n = send(sockfd, ptr + total, len - total, 0);
-    if (n == -1) {
-        if (errno == EINTR) continue; // Interrupted, try again
-        perror("send");
-        return -1; // Error
+// Allocate matrix structure and data buffer
+Matrix create_matrix(uint32_t rows, uint32_t cols) {
+    Matrix m;
+    m.rows = rows;
+    m.cols = cols;
+    m.data = malloc((size_t)rows * cols * sizeof(double)); // Use double for MA results
+    if (!m.data) {
+        perror("Failed to allocate matrix data");
+        m.rows = m.cols = 0; // Indicate failure
     }
-    if (n == 0) {
-        fprintf(stderr, "send: connection closed prematurely\n");
-        return -1; // Connection closed
+    return m;
+}
+
+void free_matrix(Matrix *m) {
+    if (m && m->data) {
+        free(m->data);
+        m->data = NULL;
+        m->rows = m->cols = 0;
     }
-    total += n;
-}
-return 0; // Success
-
-
 }
 
-// Receives exactly 'len' bytes into 'buf' from 'sockfd'. Handles partial receives.
-int recv_all(int sockfd, void *buf, size_t len) {
-size_t total = 0;
-ssize_t n;
-char *ptr = (char *)buf;
+// Get element (assuming row-major storage)
+double get_matrix_element(const Matrix *m, uint32_t r, uint32_t c) {
+    if (!m || !m->data || r >= m->rows || c >= m->cols) return NAN; // Error or invalid access
+    return m->data[(size_t)r * m->cols + c];
+}
 
-while (total < len) {
-    n = recv(sockfd, ptr + total, len - total, 0);
-    if (n == -1) {
-         if (errno == EINTR) continue; // Interrupted, try again
-        perror("recv");
-        return -1; // Error
+// Set element (assuming row-major storage)
+void set_matrix_element(Matrix *m, uint32_t r, uint32_t c, double value) {
+    if (!m || !m->data || r >= m->rows || c >= m->cols) return;
+    m->data[(size_t)r * m->cols + c] = value;
+}
+
+// Extract a sub-matrix containing specific columns from a source matrix
+Matrix extract_columns(const Matrix *source, uint32_t start_col, uint32_t num_cols) {
+    if (!source || !source->data || start_col + num_cols > source->cols) {
+        return create_matrix(0, 0); // Return empty matrix on error
     }
-    if (n == 0) {
-        fprintf(stderr, "recv: connection closed prematurely\n");
-        return -1; // Connection closed
+    Matrix dest = create_matrix(source->rows, num_cols);
+    if (!dest.data) return dest; // Allocation failed
+
+    for (uint32_t r = 0; r < source->rows; ++r) {
+        for (uint32_t c = 0; c < num_cols; ++c) {
+            // Read from source column (start_col + c)
+            double val = get_matrix_element(source, r, start_col + c);
+            // Write to destination column c
+            set_matrix_element(&dest, r, c, val);
+        }
     }
-    total += n;
+    return dest;
 }
-return 0; // Success
-}
+
+
+// --- Network Helpers (Adapted for Matrix/Vector) ---
+int send_all(int sockfd, const void *buf, size_t len); // Declaration (implementation unchanged)
+int recv_all(int sockfd, void *buf, size_t len);     // Declaration (implementation unchanged)
 
 // Send matrix dimensions and data
-int send_matrix(int sockfd, int *matrix, uint32_t rows, uint32_t cols) {
-uint32_t net_rows = htonl(rows);
-uint32_t net_cols = htonl(cols);
+int send_matrix_data(int sockfd, const Matrix *m) {
+    uint32_t net_rows = htonl(m->rows);
+    uint32_t net_cols = htonl(m->cols);
 
-if (send_all(sockfd, &net_rows, sizeof(net_rows)) == -1) return -1;
-if (send_all(sockfd, &net_cols, sizeof(net_cols)) == -1) return -1;
+    if (send_all(sockfd, &net_rows, sizeof(net_rows)) == -1) return -1;
+    if (send_all(sockfd, &net_cols, sizeof(net_cols)) == -1) return -1;
 
-size_t matrix_size_bytes = (size_t)rows * cols * sizeof(int);
-// Convert matrix elements to network byte order if needed (not strictly necessary if all machines are same endianness, but good practice)
-// For simplicity here, assuming same endianness or that ints don't need swapping for this specific problem context.
-// If needed, loop through matrix and htonl each element before sending.
-if (send_all(sockfd, matrix, matrix_size_bytes) == -1) return -1;
+    size_t matrix_size_bytes = (size_t)m->rows * m->cols * sizeof(double);
+    // Assuming doubles don't need byte swapping or using a portable format (like text or XDR) is better.
+    // For simplicity, sending raw bytes. Requires sender/receiver to have same double representation.
+    if (send_all(sockfd, m->data, matrix_size_bytes) == -1) return -1;
 
-printf("Sent matrix dimensions (%u x %u) and data (%zu bytes) to socket %d\n", rows, cols, matrix_size_bytes, sockfd);
-return 0;
+    printf("Sent matrix dimensions (%u x %u) and data (%zu bytes) to socket %d\n", m->rows, m->cols, matrix_size_bytes, sockfd);
+    return 0;
 }
 
 // Receive matrix dimensions and data
-int* recv_matrix(int sockfd, uint32_t *rows, uint32_t *cols) {
-uint32_t net_rows, net_cols;
+Matrix recv_matrix_data(int sockfd) {
+    uint32_t net_rows, net_cols;
+    uint32_t rows, cols;
 
-if (recv_all(sockfd, &net_rows, sizeof(net_rows)) == -1) return NULL;
-if (recv_all(sockfd, &net_cols, sizeof(net_cols)) == -1) return NULL;
+    if (recv_all(sockfd, &net_rows, sizeof(net_rows)) == -1) return create_matrix(0,0);
+    if (recv_all(sockfd, &net_cols, sizeof(net_cols)) == -1) return create_matrix(0,0);
 
-*rows = ntohl(net_rows);
-*cols = ntohl(net_cols);
+    rows = ntohl(net_rows);
+    cols = ntohl(net_cols);
 
-if (*rows == 0 || *cols == 0) {
-    fprintf(stderr, "Received invalid matrix dimensions (%u x %u)\n", *rows, *cols);
-    return NULL;
+    if (rows == 0 || cols == 0) {
+        fprintf(stderr, "Received invalid matrix dimensions (%u x %u)\n", rows, cols);
+        return create_matrix(0,0);
+    }
+
+    Matrix m = create_matrix(rows, cols);
+    if (!m.data) {
+        return m; // Allocation failed
+    }
+
+    size_t matrix_size_bytes = (size_t)rows * cols * sizeof(double);
+    if (recv_all(sockfd, m.data, matrix_size_bytes) == -1) {
+        free_matrix(&m);
+        return create_matrix(0,0);
+    }
+
+    printf("Received matrix dimensions (%u x %u) and data (%zu bytes) from socket %d\n", rows, cols, matrix_size_bytes, sockfd);
+    return m;
 }
 
-size_t matrix_size_bytes = (size_t)(*rows) * (*cols) * sizeof(int);
-int *matrix = malloc(matrix_size_bytes);
-if (!matrix) {
-    perror("malloc for received matrix failed");
-    return NULL;
+// Send vector size and data
+int send_vector(int sockfd, const double *vec, uint32_t size) {
+    uint32_t net_size = htonl(size);
+    if (send_all(sockfd, &net_size, sizeof(net_size)) == -1) return -1;
+
+    size_t vector_size_bytes = (size_t)size * sizeof(double);
+    if (send_all(sockfd, vec, vector_size_bytes) == -1) return -1;
+
+    printf("Sent vector size (%u) and data (%zu bytes) to socket %d\n", size, vector_size_bytes, sockfd);
+    return 0;
 }
 
-if (recv_all(sockfd, matrix, matrix_size_bytes) == -1) {
-    free(matrix);
-    return NULL;
-}
-// ntohl elements if they were converted by sender
+// Receive vector size and data. Allocates memory for the vector. Caller must free.
+double* recv_vector(int sockfd, uint32_t *size) {
+    uint32_t net_size;
+    if (recv_all(sockfd, &net_size, sizeof(net_size)) == -1) {
+        *size = 0;
+        return NULL;
+    }
+    *size = ntohl(net_size);
 
-printf("Received matrix dimensions (%u x %u) and data (%zu bytes) from socket %d\n", *rows, *cols, matrix_size_bytes, sockfd);
-return matrix;
+    if (*size == 0) {
+        return NULL; // Or return malloc(0)? Returning NULL seems safer.
+    }
+
+    size_t vector_size_bytes = (size_t)(*size) * sizeof(double);
+    double *vec = malloc(vector_size_bytes);
+    if (!vec) {
+        perror("malloc for received vector failed");
+        *size = 0;
+        // We should probably try to read the data off the socket anyway to avoid desync,
+        // but for now, just fail.
+        return NULL;
+    }
+
+    if (recv_all(sockfd, vec, vector_size_bytes) == -1) {
+        free(vec);
+        *size = 0;
+        return NULL;
+    }
+    printf("Received vector size (%u) and data (%zu bytes) from socket %d\n", *size, vector_size_bytes, sockfd);
+    return vec;
 }
+
 
 // --- Binomial Tree Helpers ---
-
-// Find the 0-based position of the least significant bit set to 1
-int find_lsb_pos(int n) {
-if (n == 0) return -1; // Or handle as error
-// ffs returns 1-based index, or 0 if no bit set
-// int pos = ffs(n);
-// return (pos > 0) ? pos - 1 : -1;
-// Manual implementation:
-int pos = 0;
-while ((n & 1) == 0) {
-n >>= 1;
-pos++;
-if (pos > 30) return -1; // Avoid infinite loop for n=0
-}
-return pos;
-}
-
-// Find the parent client ID
-// Returns 0 if it's a root node (connected to server), -1 on error
-int find_parent(int client_id, int total_clients) {
-if (total_clients <= 1 || (total_clients & (total_clients - 1)) != 0) {
-fprintf(stderr, "Error: Total clients (%d) must be a power of 2 > 1 for binomial tree.\n", total_clients);
-return -1;
-}
-int half_clients = total_clients / 2;
-int base;
-int relative_id;
-
-if (client_id >= 1 && client_id <= half_clients) { // Tree 1
-    base = 1;
-    relative_id = client_id - base; // 0-based relative ID
-    if (relative_id == 0) return 0; // Root of tree 1, parent is server
-} else if (client_id > half_clients && client_id <= total_clients) { // Tree 2
-    base = half_clients + 1;
-    relative_id = client_id - base; // 0-based relative ID
-     if (relative_id == 0) return 0; // Root of tree 2, parent is server
-} else {
-    fprintf(stderr, "Error: Invalid client_id %d for T=%d\n", client_id, total_clients);
-    return -1;
-}
-
-int lsb_pos = find_lsb_pos(relative_id + 1); // LSB of 1-based relative ID
-if (lsb_pos < 0) {
-     fprintf(stderr, "Error: Cannot find LSB for relative_id %d (client %d)\n", relative_id, client_id);
-     return -1; // Should not happen for valid relative_id > 0
-}
-
-// Parent's relative ID is relative_id - (1 << lsb_pos) ?? No, parent finding seems different
-// Let's retry based on examples: Parent of 4(rel 3) is 3(rel 2). Parent of 7(rel 6) is 5(rel 4). Parent of 8(rel 7) is 7(rel 6).
-// The LSB rule was: parent_relative_id = relative_id - (1 << lsb_pos(relative_id)) -> NO, was lsb_pos(j-base+1)
-// Let's use the structure definition: child = parent + 2^i.
-// So parent = child - 2^i for some i. Which i? The largest i such that parent + 2^i = child.
-// This i corresponds to the lsb_pos of the *relative index* of the child *within the list of children of the parent*.
-// Let's use the LSB of the *client's relative ID*:
-int lsb_pos_rel = find_lsb_pos(relative_id); // LSB of 0-based relative ID
-if (lsb_pos_rel < 0 && relative_id != 0) { // lsb_pos is -1 only for 0
-     fprintf(stderr, "Error: Cannot find LSB for relative_id %d (client %d)\n", relative_id, client_id);
-     return -1;
-}
-
-// Trying the rule: parent ID = client_id - 2^(LSB position of relative_id)
-// Test T=16, tree 1 (base=1)
-// Client 4: rel_id=3 (011). lsb_pos=0. Parent = 4 - 2^0 = 3. Correct.
-// Client 7: rel_id=6 (110). lsb_pos=1. Parent = 7 - 2^1 = 5. Correct.
-// Client 8: rel_id=7 (111). lsb_pos=0. Parent = 8 - 2^0 = 7. Correct.
-// This seems simpler and matches the structure derived earlier.
-
-int parent_id = client_id - (1 << lsb_pos_rel);
-return parent_id;
-}
-
-// Find children client IDs. Returns a dynamically allocated array of IDs terminated by 0.
-// Caller must free the returned array. Returns NULL on error.
-int* find_children(int client_id, int total_clients) {
-if (total_clients <= 1 || (total_clients & (total_clients - 1)) != 0) {
-fprintf(stderr, "Error: Total clients (%d) must be a power of 2 > 1 for binomial tree.\n", total_clients);
-return NULL;
-}
-int half_clients = total_clients / 2;
-int base;
-int tree_max_id;
-
-if (client_id >= 1 && client_id <= half_clients) { // Tree 1
-    base = 1;
-    tree_max_id = half_clients;
-} else if (client_id > half_clients && client_id <= total_clients) { // Tree 2
-    base = half_clients + 1;
-    tree_max_id = total_clients;
-} else {
-    fprintf(stderr, "Error: Invalid client_id %d for T=%d\n", client_id, total_clients);
-    return NULL;
-}
-
-int *children = malloc(sizeof(int) * (total_clients + 1)); // Max possible children + terminator
-if (!children) {
-    perror("malloc for children array failed");
-    return NULL;
-}
-int child_count = 0;
-
-// Iterate through potential children: client_id + 2^i
-for (int i = 0; ; ++i) {
-    int power_of_2 = 1 << i;
-    int potential_child_id = client_id + power_of_2;
-
-    if (potential_child_id > tree_max_id) {
-        break; // Exceeded tree boundary
-    }
-
-    // Verify that this potential child's parent is the current client_id
-    int parent_check = find_parent(potential_child_id, total_clients);
-    if (parent_check == client_id) {
-        children[child_count++] = potential_child_id;
-    } else if (parent_check == -1) {
-        // Error finding parent, propagate
-        free(children);
-        return NULL;
-    }
-    // Check for potential overflow with the next power_of_2
-    if (i >= 30) break; // Avoid large shifts
-}
-
-children[child_count] = 0; // Null-terminate the list
-return children;
-}
+int find_parent(int client_id, int total_clients);      // Declaration (implementation unchanged)
+int* find_children(int client_id, int total_clients); // Declaration (implementation unchanged)
 
 // --- Config Reader ---
-Config* read_config(const char *filename) {
-FILE *fp = fopen(filename, "r");
-if (!fp) {
-perror("fopen config.txt failed");
-return NULL;
-}
+Config* read_config(const char *filename, int n_arg, int q_arg); // Added n, q args
+void free_config(Config *config);                      // Declaration (implementation unchanged)
 
-Config *config = malloc(sizeof(Config));
-if (!config) {
-    perror("malloc for config failed");
-    fclose(fp);
-    return NULL;
-}
-config->clients = NULL; // Initialize
-
-if (fscanf(fp, "%d\n", &config->total_clients) != 1 || config->total_clients <= 0 || config->total_clients > MAX_CLIENTS) {
-    fprintf(stderr, "Invalid number of clients T in config file.\n");
-    fclose(fp);
-    free(config);
-    return NULL;
-}
-
- if ((config->total_clients & (config->total_clients - 1)) != 0 && config->total_clients != 1) {
-     fprintf(stderr, "Error: Total clients T (%d) must be a power of 2.\n", config->total_clients);
-     fclose(fp);
-     free(config);
-     return NULL;
- }
-
-
-config->clients = malloc(sizeof(ClientInfo) * config->total_clients);
-if (!config->clients) {
-    perror("malloc for client info array failed");
-    fclose(fp);
-    free(config);
-    return NULL;
-}
-
-for (int i = 0; i < config->total_clients; ++i) {
-    config->clients[i].id = i + 1; // Assign 1-based ID
-    if (fscanf(fp, "%s %d\n", config->clients[i].ip, &config->clients[i].port) != 2) {
-        fprintf(stderr, "Error reading client %d info from config file.\n", i + 1);
-        fclose(fp);
-        free(config->clients);
-        free(config);
+// --- Moving Average Computation ---
+// Computes the Order Q trailing moving average for each column in the matrix.
+// Returns a vector containing the *last* MA value computed for each column.
+// Also calculates and returns the computation time.
+double* compute_moving_average(const Matrix *m, int Q, double *computation_time) {
+    if (!m || !m->data || m->rows == 0 || m->cols == 0 || Q <= 0 || Q > m->rows) {
+        fprintf(stderr, "Invalid input for moving average computation.\n");
+        *computation_time = 0.0;
         return NULL;
     }
-     // Basic validation
-    if (config->clients[i].port <= 0 || config->clients[i].port > 65535) {
-         fprintf(stderr, "Invalid port %d for client %d\n", config->clients[i].port, i + 1);
-        fclose(fp);
-        free(config->clients);
-        free(config);
+
+    struct timeval start_time, end_time;
+    gettimeofday(&start_time, NULL);
+
+    double *result_vector = malloc(m->cols * sizeof(double));
+    if (!result_vector) {
+        perror("Failed to allocate result vector for moving average");
+        *computation_time = 0.0;
         return NULL;
     }
-    struct sockaddr_in sa;
-    if (inet_pton(AF_INET, config->clients[i].ip, &(sa.sin_addr)) != 1) {
-         fprintf(stderr, "Invalid IP address format '%s' for client %d\n", config->clients[i].ip, i + 1);
-        fclose(fp);
-        free(config->clients);
-        free(config);
-        return NULL;
+
+    for (uint32_t j = 0; j < m->cols; ++j) { // Iterate through columns
+        double current_sum = 0.0;
+        // Calculate initial sum for the first MA value (at row Q-1)
+        for (uint32_t i = 0; i < Q; ++i) {
+            current_sum += get_matrix_element(m, i, j);
+        }
+        // MA[Q-1] = current_sum / Q; // Not needed explicitly unless storing all MAs
+
+        // Slide the window
+        for (uint32_t i = Q; i < m->rows; ++i) {
+            current_sum -= get_matrix_element(m, i - Q, j); // Subtract element leaving window
+            current_sum += get_matrix_element(m, i, j);     // Add element entering window
+            // MA[i] = current_sum / Q; // Not needed explicitly
+        }
+
+        // Store the *last* computed MA value for this column
+        result_vector[j] = current_sum / Q;
     }
+
+    gettimeofday(&end_time, NULL);
+    *computation_time = time_diff(&start_time, &end_time);
+
+    printf("Computed MAs for %u columns (Q=%d). Time: %.6f s\n", m->cols, Q, *computation_time);
+    return result_vector;
 }
 
-fclose(fp);
-printf("Successfully read config for %d clients.\n", config->total_clients);
-return config;
-}
-
-void free_config(Config *config) {
-if (config) {
-free(config->clients);
-free(config);
-}
-}
 
 // --- Server Logic ---
 
-// Thread function for server sending data to one root client and waiting for ACK
-void* server_send_thread(void *arg) {
-ServerSendThreadArgs *args = (ServerSendThreadArgs *)arg;
-int client_sock = -1; // Initialize to invalid state
-struct sockaddr_in cli_addr;
+// Thread function: Sends column slice, receives result vector part
+void* server_comm_thread(void *arg) {
+    ServerCommThreadArgs *args = (ServerCommThreadArgs *)arg;
+    int client_sock = -1;
+    struct sockaddr_in cli_addr;
+    ClientInfo *target_client = NULL;
+    double *received_p_part = NULL;
+    uint32_t received_p_size = 0;
 
-// Find target client info
-ClientInfo *target_client = NULL;
-for (int i = 0; i < args->config->total_clients; ++i) {
-    if (args->config->clients[i].id == args->target_client_id) {
-        target_client = &args->config->clients[i];
-        break;
+    // Find target client info
+    for (int i = 0; i < args->config->total_clients; ++i) {
+        if (args->config->clients[i].id == args->target_client_id) {
+            target_client = &args->config->clients[i];
+            break;
+        }
     }
-}
-
-if (!target_client) {
-    fprintf(stderr, "Server: Could not find client info for ID %d\n", args->target_client_id);
-    pthread_exit((void*)-1);
-}
-
-// Create socket
-client_sock = socket(AF_INET, SOCK_STREAM, 0);
-if (client_sock < 0) {
-    perror("Server: socket creation failed");
-    pthread_exit((void*)-1);
-}
-
-// Prepare client address
-memset(&cli_addr, 0, sizeof(cli_addr));
-cli_addr.sin_family = AF_INET;
-cli_addr.sin_port = htons(target_client->port);
-if (inet_pton(AF_INET, target_client->ip, &cli_addr.sin_addr) <= 0) {
-    fprintf(stderr, "Server: Invalid address/ Address not supported for client %d\n", args->target_client_id);
-    close(client_sock);
-    pthread_exit((void*)-1);
-}
-
-// Connect to client
-printf("Server: Connecting to Client %d (%s:%d)...\n", args->target_client_id, target_client->ip, target_client->port);
-if (connect(client_sock, (struct sockaddr *)&cli_addr, sizeof(cli_addr)) < 0) {
-    perror("Server: connect failed");
-    fprintf(stderr, "Server: Failed to connect to Client %d (%s:%d)\n", args->target_client_id, target_client->ip, target_client->port);
-    close(client_sock);
-    pthread_exit((void*)-1);
-}
-printf("Server: Connected successfully to Client %d.\n", args->target_client_id);
-
-
-// Send matrix part
-if (send_matrix(client_sock, args->matrix_part, args->rows, args->cols) != 0) {
-    fprintf(stderr, "Server: Failed to send matrix to Client %d\n", args->target_client_id);
-    close(client_sock);
-    pthread_exit((void*)-1);
-}
- printf("Server: Matrix part sent to Client %d.\n", args->target_client_id);
-
-// Wait for ACK
-char ack_buf[ACK_LEN + 1];
-printf("Server: Waiting for ACK from Client %d...\n", args->target_client_id);
-if (recv_all(client_sock, ack_buf, ACK_LEN) != 0) {
-    fprintf(stderr, "Server: Failed to receive ACK from Client %d\n", args->target_client_id);
-    close(client_sock);
-    pthread_exit((void*)-1);
-}
-ack_buf[ACK_LEN] = '\0';
-
-if (strcmp(ack_buf, ACK_MSG) == 0) {
-    printf("Server: Received ACK from Client %d.\n", args->target_client_id);
-} else {
-    fprintf(stderr, "Server: Received invalid ACK ('%s') from Client %d\n", ack_buf, args->target_client_id);
-    close(client_sock);
-    pthread_exit((void*)-1);
-}
-
-close(client_sock);
-pthread_exit((void*)0); // Success
-}
-
-void run_server(int n) {
-printf("--- Running as SERVER ---\n");
-printf("Matrix size n = %d\n", n);
-
-// Read config
-Config *config = read_config(CONFIG_FILE);
-if (!config) {
-    exit(EXIT_FAILURE);
-}
-if (config->total_clients == 0) {
-     fprintf(stderr, "Server: No clients specified in config.txt\n");
-     free_config(config);
-     exit(EXIT_FAILURE);
-}
- if (n % config->total_clients != 0) {
-    fprintf(stderr, "Server Error: Matrix size n (%d) must be divisible by total clients T (%d).\n", n, config->total_clients);
-    free_config(config);
-    exit(EXIT_FAILURE);
-}
- if ((config->total_clients & (config->total_clients - 1)) != 0 && config->total_clients > 1) {
-     fprintf(stderr, "Server Error: Total clients T (%d) must be a power of 2.\n", config->total_clients);
-     free_config(config);
-     exit(EXIT_FAILURE);
- }
-
-
-// Allocate and initialize matrix (can be very large!)
-printf("Server: Allocating %d x %d matrix...\n", n, n);
-size_t matrix_elements = (size_t)n * n;
-size_t matrix_size_bytes = matrix_elements * sizeof(int);
-int *matrix = malloc(matrix_size_bytes);
-if (!matrix) {
-    fprintf(stderr, "Server: Failed to allocate matrix (%zu bytes)\n", matrix_size_bytes);
-    free_config(config);
-    exit(EXIT_FAILURE);
-}
-printf("Server: Initializing matrix...\n");
-for (size_t i = 0; i < n; ++i) {
-    for (size_t j = 0; j < n; ++j) {
-        matrix[i * n + j] = (int)(i * n + j); // Sequential values
+    if (!target_client) {
+        fprintf(stderr, "Server: Could not find client info for ID %d\n", args->target_client_id);
+        pthread_exit((void*)-1);
     }
+
+    // --- Connect to Client ---
+    client_sock = socket(AF_INET, SOCK_STREAM, 0);
+    // ... (socket creation, prepare cli_addr, connect - same as before) ...
+     if (client_sock < 0) { perror("Server: socket"); pthread_exit((void*)-1); }
+     memset(&cli_addr, 0, sizeof(cli_addr));
+     cli_addr.sin_family = AF_INET;
+     cli_addr.sin_port = htons(target_client->port);
+     if (inet_pton(AF_INET, target_client->ip, &cli_addr.sin_addr) <= 0) {
+         fprintf(stderr, "Server: Invalid address for client %d\n", args->target_client_id); close(client_sock); pthread_exit((void*)-1);
+     }
+     printf("Server: Connecting to Client %d (%s:%d)...\n", args->target_client_id, target_client->ip, target_client->port);
+     if (connect(client_sock, (struct sockaddr *)&cli_addr, sizeof(cli_addr)) < 0) {
+         perror("Server: connect failed"); close(client_sock); pthread_exit((void*)-1);
+     }
+     printf("Server: Connected successfully to Client %d.\n", args->target_client_id);
+
+    // --- Send Matrix Columns ---
+    if (send_matrix_data(client_sock, &args->matrix_part) != 0) {
+        fprintf(stderr, "Server: Failed to send matrix columns to Client %d\n", args->target_client_id);
+        close(client_sock);
+        pthread_exit((void*)-1);
+    }
+    printf("Server: Matrix columns sent to Client %d.\n", args->target_client_id);
+    // Server no longer needs its copy of the columns after sending
+    free_matrix(&args->matrix_part);
+
+
+    // --- Wait for Result Vector ---
+    printf("Server: Waiting for result vector from Client %d...\n", args->target_client_id);
+    received_p_part = recv_vector(client_sock, &received_p_size);
+
+    if (!received_p_part) {
+        fprintf(stderr, "Server: Failed to receive result vector from Client %d\n", args->target_client_id);
+        close(client_sock);
+        pthread_exit((void*)-1);
+    }
+    printf("Server: Received result vector (size %u) from Client %d.\n", received_p_size, args->target_client_id);
+
+    // --- Store Received Vector ---
+    // Calculate expected size
+    uint32_t expected_cols_per_root = args->config->n / 2; // Assuming T>=2
+     if (args->config->total_clients == 1) expected_cols_per_root = args->config->n;
+
+    if (received_p_size != expected_cols_per_root) {
+         fprintf(stderr, "Server: Received vector size %u from client %d, expected %u\n",
+                 received_p_size, args->target_client_id, expected_cols_per_root);
+         free(received_p_part);
+         close(client_sock);
+         pthread_exit((void*)-1);
+    }
+
+    // Copy received data to the designated spot in the server's final vector
+    // The args->result_vector_part already points to the correct offset
+    pthread_mutex_lock(args->result_mutex);
+    memcpy(args->result_vector_part, received_p_part, received_p_size * sizeof(double));
+    pthread_mutex_unlock(args->result_mutex);
+
+    free(received_p_part); // Free the buffer allocated by recv_vector
+    close(client_sock);
+    pthread_exit((void*)0); // Success
 }
-printf("Server: Matrix created successfully.\n");
 
-// Prepare arguments for sender threads
-pthread_t tid1, tid2;
-ServerSendThreadArgs args1, args2;
-int half_rows = n / 2;
-int root_client_1_id = 1;
-int root_client_2_id = (config->total_clients / 2) + 1;
+void run_server(int n, int q) {
+    printf("--- Running as SERVER ---\n");
+    printf("Matrix size n = %d, Moving Average Order Q = %d\n", n, q);
 
-if (config->total_clients == 1) { // Special case: only one client
-    root_client_2_id = -1; // Indicate no second client
-    half_rows = n; // Send the whole matrix to client 1
-} else if (config->total_clients < 1) {
-     fprintf(stderr, "Server Error: Invalid number of clients: %d\n", config->total_clients);
-     free(matrix);
-     free_config(config);
-     exit(EXIT_FAILURE);
-}
+    // Read config
+    Config *config = read_config(CONFIG_FILE, n, q);
+    if (!config) exit(EXIT_FAILURE);
+    // Basic validations (T power of 2, n divisible by T, Q <= n etc.)
+    if (config->total_clients <= 0 || ((config->total_clients & (config->total_clients - 1)) != 0 && config->total_clients > 1)) {
+         fprintf(stderr, "Server Error: T (%d) must be > 0 and a power of 2.\n", config->total_clients); free_config(config); exit(EXIT_FAILURE);
+    }
+     if (n % config->total_clients != 0) {
+         fprintf(stderr, "Server Error: n (%d) must be divisible by T (%d).\n", n, config->total_clients); free_config(config); exit(EXIT_FAILURE);
+     }
+     if (q <= 0 || q > n) {
+          fprintf(stderr, "Server Error: Q (%d) must be between 1 and n (%d).\n", q, n); free_config(config); exit(EXIT_FAILURE);
+     }
+
+    // Allocate and initialize original matrix X
+    printf("Server: Allocating %d x %d matrix...\n", n, n);
+    Matrix matrix_x = create_matrix(n, n);
+     if (!matrix_x.data) { free_config(config); exit(EXIT_FAILURE); }
+
+    printf("Server: Initializing matrix X...\n");
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            // Initialize with some values (e.g., doubles)
+            set_matrix_element(&matrix_x, i, j, (double)(i * n + j)); // Example init
+        }
+    }
+    printf("Server: Matrix X created successfully.\n");
+
+    // Allocate space for the final result vector 'p'
+    double *final_p = malloc(n * sizeof(double));
+    if (!final_p) { error_exit("Server: Failed to allocate final result vector p"); }
+    pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
-args1.matrix_part = matrix; // First half starts at the beginning
-args1.rows = half_rows;
-args1.cols = n;
-args1.target_client_id = root_client_1_id;
-args1.config = config;
+    // Prepare arguments for sender/receiver threads
+    pthread_t tid1, tid2;
+    ServerCommThreadArgs args1, args2;
+    int root_client_1_id = 1;
+    int root_client_2_id = (config->total_clients == 1) ? -1 : (config->total_clients / 2) + 1;
+    uint32_t cols_per_root = (config->total_clients == 1) ? n : n / 2;
 
-if (root_client_2_id > 0) {
-    args2.matrix_part = matrix + (size_t)half_rows * n; // Second half offset
-    args2.rows = n - half_rows; // Remaining rows (handles odd n if needed, though we assume divisibility)
-    args2.cols = n;
-    args2.target_client_id = root_client_2_id;
-    args2.config = config;
-}
+    // Extract columns for client 1
+    printf("Server: Extracting columns 0 to %u for Client %d\n", cols_per_root - 1, root_client_1_id);
+    args1.matrix_part = extract_columns(&matrix_x, 0, cols_per_root);
+    if (!args1.matrix_part.data) error_exit("Server: Failed to extract columns for client 1");
+    args1.target_client_id = root_client_1_id;
+    args1.config = config;
+    args1.result_vector_part = final_p; // Client 1 results go at the start
+    args1.result_mutex = &result_mutex;
 
-// Record time before sending
-struct timeval time_before, time_after;
-gettimeofday(&time_before, NULL);
-printf("Server: Starting data transfer at %ld.%06ld\n", time_before.tv_sec, time_before.tv_usec);
+    if (root_client_2_id > 0) {
+        printf("Server: Extracting columns %u to %u for Client %d\n", cols_per_root, n - 1, root_client_2_id);
+        args2.matrix_part = extract_columns(&matrix_x, cols_per_root, n - cols_per_root);
+         if (!args2.matrix_part.data) error_exit("Server: Failed to extract columns for client 2");
+        args2.target_client_id = root_client_2_id;
+        args2.config = config;
+        args2.result_vector_part = final_p + cols_per_root; // Client 2 results go in the second half
+        args2.result_mutex = &result_mutex;
+    }
 
-// Start sender threads
-printf("Server: Launching thread to send first half (%d rows) to Client %d\n", args1.rows, args1.target_client_id);
-if (pthread_create(&tid1, NULL, server_send_thread, &args1) != 0) {
-    perror("Server: Failed to create thread for client 1");
-    free(matrix);
-    free_config(config);
-    exit(EXIT_FAILURE);
-}
+    // Original matrix X no longer needed if columns were copied
+    free_matrix(&matrix_x); // Free the large initial matrix
 
-if (root_client_2_id > 0) {
-    printf("Server: Launching thread to send second half (%d rows) to Client %d\n", args2.rows, args2.target_client_id);
-    if (pthread_create(&tid2, NULL, server_send_thread, &args2) != 0) {
-        perror("Server: Failed to create thread for client 2");
-        // Consider how to handle tid1 if it's running
-        pthread_cancel(tid1); // Attempt to cancel
-        pthread_join(tid1, NULL); // Wait for it
-        free(matrix);
+    // Record time before starting communication
+    struct timeval time_before, time_after;
+    gettimeofday(&time_before, NULL);
+    printf("Server: Starting communication at %ld.%06ld\n", time_before.tv_sec, time_before.tv_usec);
+
+    // Launch threads
+    printf("Server: Launching thread for Client %d\n", args1.target_client_id);
+    if (pthread_create(&tid1, NULL, server_comm_thread, &args1) != 0) {
+        error_exit("Server: Failed to create thread for client 1");
+    }
+    if (root_client_2_id > 0) {
+         printf("Server: Launching thread for Client %d\n", args2.target_client_id);
+        if (pthread_create(&tid2, NULL, server_comm_thread, &args2) != 0) {
+            // Clean up thread 1?
+            perror("Server: Failed to create thread for client 2"); exit(EXIT_FAILURE); // Simplified cleanup
+        }
+    }
+
+    // Wait for threads to complete (receive results)
+    void *ret1, *ret2 = (void*)0;
+    pthread_join(tid1, &ret1);
+    if (root_client_2_id > 0) {
+        pthread_join(tid2, &ret2);
+    }
+
+    // Server work (rebuilding vector p) is implicitly done when threads write results.
+
+    // Record time after receiving results and threads joined
+    gettimeofday(&time_after, NULL);
+    printf("Server: Communication and rebuild finished at %ld.%06ld\n", time_after.tv_sec, time_after.tv_usec);
+
+    // Check thread results
+    if (ret1 != (void*)0 || (root_client_2_id > 0 && ret2 != (void*)0)) {
+        fprintf(stderr, "Server: One or more communication threads failed. Exiting.\n");
+        free(final_p);
+        pthread_mutex_destroy(&result_mutex);
         free_config(config);
         exit(EXIT_FAILURE);
     }
-}
+    pthread_mutex_destroy(&result_mutex);
 
-// Wait for threads to complete (i.e., ACKs received)
-void *ret1, *ret2 = (void*)0; // Initialize ret2 to success for the single client case
-pthread_join(tid1, &ret1);
-if (root_client_2_id > 0) {
-    pthread_join(tid2, &ret2);
-}
-
-// Record time after receiving ACKs
-gettimeofday(&time_after, NULL);
-printf("Server: Received final ACK at %ld.%06ld\n", time_after.tv_sec, time_after.tv_usec);
+    printf("Server: All result vectors received successfully.\n");
+    // Optional: Print first few elements of final_p for verification
+     printf("Server: Final vector p (first 10 elements): [ ");
+     for(int i=0; i<n && i<10; ++i) printf("%.2f ", final_p[i]);
+     printf("... ]\n");
 
 
-// Check thread results
-if (ret1 != (void*)0 || (root_client_2_id > 0 && ret2 != (void*)0)) {
-    fprintf(stderr, "Server: One or more send/ack threads failed. Exiting.\n");
-    free(matrix);
+    // Calculate and print elapsed time
+    double elapsed = time_diff(&time_before, &time_after);
+    printf("Server: Total time elapsed: %.6f seconds\n", elapsed);
+    // Output for Table 1 (append to a file or just print)
+    printf("TABLE1_DATA: n=%d t=%d time=%.6f\n", config->n, config->total_clients, elapsed);
+
+
+    // Cleanup
+    free(final_p);
     free_config(config);
-    exit(EXIT_FAILURE);
+    printf("--- Server finished ---\n");
 }
 
-printf("Server: All ACKs received successfully.\n");
-
-// Calculate and print elapsed time
-double elapsed = time_diff(&time_before, &time_after);
-printf("Server: Total time elapsed: %.6f seconds\n", elapsed);
-
-// Cleanup
-free(matrix);
-free_config(config);
-printf("--- Server finished ---\n");
-}
 
 // --- Client Logic ---
 
-// Thread function for client sending data to one child and waiting for ACK
-void* client_send_child_thread(void *arg) {
-ClientSendThreadArgs *args = (ClientSendThreadArgs *)arg;
-int child_sock = -1;
-struct sockaddr_in child_addr;
-ClientInfo *child_info = NULL;
-bool ack_local_flag = false; // Local status
+// Thread function: Sends column slice to child, receives result vector back
+void* client_comm_child_thread(void *arg) {
+    ClientCommThreadArgs *args = (ClientCommThreadArgs *)arg;
+    int child_sock = -1;
+    struct sockaddr_in child_addr;
+    ClientInfo *child_info = NULL;
+    double *child_p = NULL;
+    uint32_t child_p_size = 0;
 
-// Find child client info
-for (int i = 0; i < args->config->total_clients; ++i) {
-    if (args->config->clients[i].id == args->child_id) {
-        child_info = &args->config->clients[i];
-        break;
+     // Find child client info
+    for (int i = 0; i < args->config->total_clients; ++i) {
+        if (args->config->clients[i].id == args->child_id) {
+            child_info = &args->config->clients[i];
+            break;
+        }
     }
-}
-if (!child_info) {
-    fprintf(stderr, "Client Child Sender: Could not find client info for child ID %d\n", args->child_id);
-    pthread_exit((void*)-1);
-}
-
-// Create socket
-child_sock = socket(AF_INET, SOCK_STREAM, 0);
-if (child_sock < 0) {
-    perror("Client Child Sender: socket creation failed");
-     pthread_exit((void*)-1);
-}
-
-// Prepare child address
-memset(&child_addr, 0, sizeof(child_addr));
-child_addr.sin_family = AF_INET;
-child_addr.sin_port = htons(child_info->port);
-if (inet_pton(AF_INET, child_info->ip, &child_addr.sin_addr) <= 0) {
-    fprintf(stderr, "Client Child Sender: Invalid address for child %d\n", args->child_id);
-    close(child_sock);
-    pthread_exit((void*)-1);
-}
-
-// Connect to child
-printf("Client Child Sender: Connecting to Child %d (%s:%d)...\n", args->child_id, child_info->ip, child_info->port);
- if (connect(child_sock, (struct sockaddr *)&child_addr, sizeof(child_addr)) < 0) {
-    perror("Client Child Sender: connect failed");
-    fprintf(stderr, "Client Child Sender: Failed connection to child %d\n", args->child_id);
-    close(child_sock);
-    pthread_exit((void*)-1);
-}
- printf("Client Child Sender: Connected successfully to Child %d.\n", args->child_id);
-
-
-// Send matrix part
-if (send_matrix(child_sock, args->matrix_part, args->rows, args->cols) != 0) {
-    fprintf(stderr, "Client Child Sender: Failed to send matrix to Child %d\n", args->child_id);
-    close(child_sock);
-    pthread_exit((void*)-1);
-}
-printf("Client Child Sender: Matrix part sent to Child %d.\n", args->child_id);
-
-// Wait for ACK
-char ack_buf[ACK_LEN + 1];
-printf("Client Child Sender: Waiting for ACK from Child %d...\n", args->child_id);
-if (recv_all(child_sock, ack_buf, ACK_LEN) != 0) {
-    fprintf(stderr, "Client Child Sender: Failed to receive ACK from Child %d\n", args->child_id);
-    close(child_sock);
-    pthread_exit((void*)-1);
-}
-ack_buf[ACK_LEN] = '\0';
-
- if (strcmp(ack_buf, ACK_MSG) == 0) {
-    printf("Client Child Sender: Received ACK from Child %d.\n", args->child_id);
-    ack_local_flag = true;
-} else {
-    fprintf(stderr, "Client Child Sender: Received invalid ACK ('%s') from Child %d\n", ack_buf, args->child_id);
-    close(child_sock);
-    pthread_exit((void*)-1);
-}
-
-close(child_sock);
-
-// Update shared ACK flag safely
-pthread_mutex_lock(args->ack_mutex);
-*(args->ack_received_flag) = 1; // Mark ACK as received for this child
-pthread_mutex_unlock(args->ack_mutex);
-
-pthread_exit((void*)0); // Success
-}
-
-void run_client(int port_to_listen, int client_id) {
-printf("--- Running as CLIENT ---\n");
-printf("Client ID: %d, Listening on Port: %d\n", client_id, port_to_listen);
-
-// Read config to get T and other client details
-Config *config = read_config(CONFIG_FILE);
-if (!config) {
-    exit(EXIT_FAILURE);
-}
- if (client_id <= 0 || client_id > config->total_clients) {
-    fprintf(stderr, "Client Error: Invalid client ID %d for T=%d\n", client_id, config->total_clients);
-    free_config(config);
-    exit(EXIT_FAILURE);
-}
-
-// Validate own port (optional, but good check)
-bool port_matches = false;
-for(int i=0; i<config->total_clients; ++i) {
-    if (config->clients[i].id == client_id && config->clients[i].port == port_to_listen) {
-        port_matches = true;
-        break;
+    if (!child_info) {
+        fprintf(stderr, "Client Child Comm: Could not find info for child ID %d\n", args->child_id);
+        pthread_exit((void*)-1);
     }
-}
- if (!port_matches) {
-     fprintf(stderr, "Client Warning: Listening port %d does not match config file for client %d.\n", port_to_listen, client_id);
-     // Continue anyway, assuming command line is correct.
- }
 
-
-// Setup listening socket
-int listen_fd, conn_fd;
-struct sockaddr_in serv_addr, cli_addr;
-socklen_t cli_len = sizeof(cli_addr);
-
-listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-if (listen_fd < 0) {
-    error_exit("Client: Socket creation failed");
-}
-
-int optval = 1;
-if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-     perror("Client: setsockopt(SO_REUSEADDR) failed");
-     // Non-fatal, continue
-}
-
-
-memset(&serv_addr, 0, sizeof(serv_addr));
-serv_addr.sin_family = AF_INET;
-serv_addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on any interface
-serv_addr.sin_port = htons(port_to_listen);
-
-if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-    fprintf(stderr, "Client %d: Failed to bind to port %d\n", client_id, port_to_listen);
-    error_exit("Client: bind failed");
-}
-
-if (listen(listen_fd, 5) < 0) {
-    error_exit("Client: listen failed");
-}
-
-printf("Client %d: Listening on port %d...\n", client_id, port_to_listen);
-
-// Accept connection from parent/server
-conn_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
-if (conn_fd < 0) {
-    error_exit("Client: accept failed");
-}
-close(listen_fd); // Stop listening after accepting one connection
-
-// Record time_before
-struct timeval time_before, time_after;
-gettimeofday(&time_before, NULL);
-char cl_ip[INET_ADDRSTRLEN];
-inet_ntop(AF_INET, &cli_addr.sin_addr, cl_ip, sizeof(cl_ip));
-printf("Client %d: Accepted connection from %s:%d at %ld.%06ld\n",
-       client_id, cl_ip, ntohs(cli_addr.sin_port), time_before.tv_sec, time_before.tv_usec);
-
-// Receive matrix part
-uint32_t received_rows, received_cols;
-int *my_matrix_part = recv_matrix(conn_fd, &received_rows, &received_cols);
-if (!my_matrix_part) {
-    fprintf(stderr, "Client %d: Failed to receive matrix.\n", client_id);
-    close(conn_fd);
-    free_config(config);
-    exit(EXIT_FAILURE);
-}
-printf("Client %d: Received initial matrix part (%u x %u)\n", client_id, received_rows, received_cols);
-
-
-// Determine children
-int *children_ids = find_children(client_id, config->total_clients);
-if (!children_ids) {
-     fprintf(stderr, "Client %d: Failed to determine children.\n", client_id);
-     free(my_matrix_part);
-     close(conn_fd);
-     free_config(config);
-     exit(EXIT_FAILURE);
-}
-
-int num_children = 0;
-while (children_ids[num_children] != 0) {
-    num_children++;
-}
-
-// Check if leaf node
-if (num_children == 0) {
-    printf("Client %d: Is a leaf node. Processing complete.\n", client_id);
-    // Leaf node processing: just ACK parent
-} else {
-    printf("Client %d: Is an internal node with %d children: ", client_id, num_children);
-    for(int i=0; i<num_children; ++i) printf("%d ", children_ids[i]);
-    printf("\n");
-
-    // Internal node processing: distribute matrix parts
-    pthread_t *child_threads = malloc(sizeof(pthread_t) * num_children);
-    ClientSendThreadArgs *child_args = malloc(sizeof(ClientSendThreadArgs) * num_children);
-    int *ack_flags = malloc(sizeof(int) * num_children);
-    pthread_mutex_t ack_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    if (!child_threads || !child_args || !ack_flags) {
-         perror("Client: Failed to allocate memory for child thread management");
-         free(children_ids);
-         free(my_matrix_part);
-         close(conn_fd);
-         free_config(config);
-         exit(EXIT_FAILURE);
+    // --- Connect to child ---
+    child_sock = socket(AF_INET, SOCK_STREAM, 0);
+    // ... (socket creation, prepare child_addr, connect - similar to server) ...
+    if (child_sock < 0) { perror("Client Child Comm: socket"); pthread_exit((void*)-1); }
+    memset(&child_addr, 0, sizeof(child_addr));
+    child_addr.sin_family = AF_INET;
+    child_addr.sin_port = htons(child_info->port);
+    if (inet_pton(AF_INET, child_info->ip, &child_addr.sin_addr) <= 0) {
+        fprintf(stderr, "Client Child Comm: Invalid address for child %d\n", args->child_id); close(child_sock); pthread_exit((void*)-1);
     }
-    for(int i=0; i<num_children; ++i) ack_flags[i] = 0; // Initialize ACK flags
+    printf("Client Child Comm: Connecting to Child %d (%s:%d)...\n", args->child_id, child_info->ip, child_info->port);
+    if (connect(child_sock, (struct sockaddr *)&child_addr, sizeof(child_addr)) < 0) {
+       perror("Client Child Comm: connect failed"); close(child_sock); pthread_exit((void*)-1);
+    }
+    printf("Client Child Comm: Connected successfully to Child %d.\n", args->child_id);
+
+    // --- Send Matrix Columns to Child ---
+    if (send_matrix_data(child_sock, &args->matrix_part) != 0) {
+        fprintf(stderr, "Client Child Comm: Failed to send matrix to Child %d\n", args->child_id);
+        free_matrix(&args->matrix_part); // Clean up matrix part even on failure
+        close(child_sock);
+        pthread_exit((void*)-1);
+    }
+    printf("Client Child Comm: Matrix columns sent to Child %d.\n", args->child_id);
+    // Parent client no longer needs this specific slice after sending
+    free_matrix(&args->matrix_part);
+
+    // --- Wait for Result Vector from Child ---
+    printf("Client Child Comm: Waiting for result vector from Child %d...\n", args->child_id);
+    child_p = recv_vector(child_sock, &child_p_size);
+
+    if (!child_p) {
+        fprintf(stderr, "Client Child Comm: Failed to receive result vector from Child %d\n", args->child_id);
+        close(child_sock);
+        pthread_exit((void*)-1);
+    }
+    printf("Client Child Comm: Received result vector (size %u) from Child %d.\n", child_p_size, args->child_id);
+    close(child_sock); // Done with this child connection
+
+    // --- Store Received Vector Safely ---
+    pthread_mutex_lock(args->child_result_mutex);
+    // We need a way to store multiple results. Let's assume the main thread prepared space.
+    // The args should point to the correct location.
+    *(args->received_child_vector_size) = child_p_size;
+    *(args->received_child_vector) = child_p; // Transfer ownership of malloc'd buffer
+    pthread_mutex_unlock(args->child_result_mutex);
 
 
-    uint32_t current_rows = received_rows;
-    int *current_matrix_ptr = my_matrix_part; // Pointer to the start of the current relevant block
+    pthread_exit((void*)0); // Success
+}
 
-    // Send to children in reverse order of ID (highest ID first)
-    for (int i = num_children - 1; i >= 0; --i) {
-        int child_id = children_ids[i];
-        uint32_t rows_to_send = current_rows / 2;
-        uint32_t rows_to_keep = current_rows - rows_to_send;
-        int *matrix_to_send_ptr = current_matrix_ptr + (size_t)rows_to_keep * received_cols; // Send lower half
+void run_client(int port_to_listen, int client_id, int q) {
+    printf("--- Running as CLIENT ID %d ---\n", client_id);
+    printf("Listening on Port: %d, MA Order Q = %d\n", port_to_listen, q);
 
-         printf("Client %d: Preparing to send %u rows (from %u total) to child %d.\n",
-               client_id, rows_to_send, current_rows, child_id);
+    // Read config
+    Config *config = read_config(CONFIG_FILE, 0, q); // n not needed directly, q is
+    if (!config) exit(EXIT_FAILURE);
+     if (client_id <= 0 || client_id > config->total_clients) { /* ... error ... */ exit(EXIT_FAILURE); }
+     config->q = q; // Store Q in config for easy access
 
 
-        if (rows_to_send > 0) { // Only send if there are rows to send
-            child_args[i].child_id = child_id;
-            child_args[i].matrix_part = matrix_to_send_ptr;
-            child_args[i].rows = rows_to_send;
-            child_args[i].cols = received_cols;
-            child_args[i].config = config;
-            child_args[i].ack_received_flag = &ack_flags[i];
-            child_args[i].ack_mutex = &ack_mutex;
+    // Setup listening socket
+    int listen_fd, conn_fd;
+    struct sockaddr_in serv_addr, cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    // ... (socket, setsockopt, bind, listen - same as before) ...
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) error_exit("Client: Socket creation failed");
+    int optval = 1; setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)); // Ignore error
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET; serv_addr.sin_addr.s_addr = htonl(INADDR_ANY); serv_addr.sin_port = htons(port_to_listen);
+    if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) error_exit("Client: bind failed");
+    if (listen(listen_fd, 5) < 0) error_exit("Client: listen failed");
+    printf("Client %d: Listening on port %d...\n", client_id, port_to_listen);
 
-            if (pthread_create(&child_threads[i], NULL, client_send_child_thread, &child_args[i]) != 0) {
-                perror("Client: Failed to create thread for child");
-                // Attempt cleanup
-                // Need robust cancellation/joining here if some threads started
-                free(ack_flags);
-                free(child_args);
-                free(child_threads);
-                free(children_ids);
-                free(my_matrix_part);
-                close(conn_fd);
-                free_config(config);
-                exit(EXIT_FAILURE);
-            }
-        } else {
-             printf("Client %d: No rows left to send to child %d, marking ACK as received.\n", client_id, child_id);
-             ack_flags[i] = 1; // Mark as done if no data sent
+
+    // Accept connection from parent/server
+    conn_fd = accept(listen_fd, (struct sockaddr*)&cli_addr, &cli_len);
+    if (conn_fd < 0) error_exit("Client: accept failed");
+    close(listen_fd); // Stop listening
+
+    char cl_ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &cli_addr.sin_addr, cl_ip, sizeof(cl_ip));
+    printf("Client %d: Accepted connection from %s:%d\n", client_id, cl_ip, ntohs(cli_addr.sin_port));
+
+    // --- Receive Matrix Columns ---
+    Matrix my_matrix_cols = recv_matrix_data(conn_fd);
+    if (!my_matrix_cols.data) {
+        fprintf(stderr, "Client %d: Failed to receive matrix columns.\n", client_id);
+        close(conn_fd); free_config(config); exit(EXIT_FAILURE);
+    }
+     printf("Client %d: Received initial matrix columns (%u rows x %u cols)\n", client_id, my_matrix_cols.rows, my_matrix_cols.cols);
+
+
+    // --- Compute Moving Average (Timed) ---
+    double computation_time = 0.0;
+    double *p_local = compute_moving_average(&my_matrix_cols, config->q, &computation_time);
+    if (!p_local) {
+        fprintf(stderr, "Client %d: Failed to compute moving average.\n", client_id);
+        free_matrix(&my_matrix_cols); close(conn_fd); free_config(config); exit(EXIT_FAILURE);
+    }
+    uint32_t p_local_size = my_matrix_cols.cols; // MA vector size = number of cols received
+    printf("Client %d: MA computation time: %.6f seconds\n", client_id, computation_time);
+    // Output for Table 2 (append to file or print)
+    printf("TABLE2_DATA: n=%d t=%d client=%d time=%.6f\n", config->n, config->total_clients, client_id, computation_time);
+
+
+    // --- Handle Children (Distribution & M1PR) ---
+    int *children_ids = find_children(client_id, config->total_clients);
+     if (!children_ids) { /* ... error ... */ exit(EXIT_FAILURE); }
+    int num_children = 0;
+    while(children_ids[num_children] != 0) num_children++;
+
+    double *p_combined = NULL;
+    uint32_t p_combined_size = 0;
+
+    if (num_children == 0) {
+        printf("Client %d: Is a leaf node.\n", client_id);
+        // Leaf node: the result to send back is just p_local
+        p_combined = p_local; // Transfer ownership
+        p_combined_size = p_local_size;
+        p_local = NULL; // Avoid double free
+    } else {
+        printf("Client %d: Is an internal node with %d children.\n", client_id, num_children);
+
+        pthread_t *child_threads = malloc(sizeof(pthread_t) * num_children);
+        ClientCommThreadArgs *child_args = malloc(sizeof(ClientCommThreadArgs) * num_children);
+        // Need storage for results received FROM children
+        double **child_results_vec = calloc(num_children, sizeof(double*)); // Array of pointers to vectors
+        uint32_t *child_results_size = calloc(num_children, sizeof(uint32_t));
+        pthread_mutex_t child_result_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+        if (!child_threads || !child_args || !child_results_vec || !child_results_size) {
+             error_exit("Client: Failed malloc for child thread management");
         }
 
+        uint32_t current_cols_in_node = my_matrix_cols.cols;
+        uint32_t current_col_offset = 0; // Tracks starting column within my_matrix_cols
 
-        // Update remaining matrix for next iteration (or for self)
-        current_rows = rows_to_keep;
-        // current_matrix_ptr remains the same (points to the start of the upper block)
-    }
+        // Send to children (highest ID first) and launch receiver threads
+        for (int i = num_children - 1; i >= 0; --i) {
+            int child_id = children_ids[i];
+            // Columns are halved at each step down the tree for non-leaf children
+            uint32_t cols_to_send = current_cols_in_node / 2;
+            uint32_t cols_to_keep = current_cols_in_node - cols_to_send;
 
-     printf("Client %d: Keeping final %u rows for self.\n", client_id, current_rows);
+            if (cols_to_send > 0) {
+                printf("Client %d: Preparing to send %u cols (starting at local col %u) to child %d.\n",
+                       client_id, cols_to_send, cols_to_keep, child_id); // Sending the 'lower half' columns
+
+                 // Extract the columns to send from the *original* matrix received by this node
+                Matrix cols_for_child = extract_columns(&my_matrix_cols, cols_to_keep + current_col_offset, cols_to_send);
+                 if (!cols_for_child.data) {
+                     fprintf(stderr, "Client %d: Failed to extract columns for child %d\n", client_id, child_id);
+                     // Major error, attempt cleanup
+                     exit(EXIT_FAILURE);
+                 }
 
 
-    // Wait for all child threads to complete (receive ACKs)
-    printf("Client %d: Waiting for ACKs from all %d children...\n", client_id, num_children);
-    bool all_acks_received = true;
-    for (int i = 0; i < num_children; ++i) {
-         if (child_args[i].rows > 0) { // Only join threads that were actually created
-            void *t_ret;
-            pthread_join(child_threads[i], &t_ret);
-            if (t_ret != (void*)0) {
-                fprintf(stderr, "Client %d: Thread for child %d failed.\n", client_id, children_ids[i]);
-                all_acks_received = false;
-                // Maybe continue waiting for others? Or exit? For now, note failure.
+                child_args[i].child_id = child_id;
+                child_args[i].matrix_part = cols_for_child; // Pass the extracted columns
+                child_args[i].config = config;
+                child_args[i].received_child_vector = &child_results_vec[i];
+                child_args[i].received_child_vector_size = &child_results_size[i];
+                child_args[i].child_result_mutex = &child_result_mutex;
+
+
+                if (pthread_create(&child_threads[i], NULL, client_comm_child_thread, &child_args[i]) != 0) {
+                    perror("Client: Failed to create thread for child");
+                    exit(EXIT_FAILURE); // Simplified cleanup
+                }
+            } else {
+                 // Should not happen if cols are distributed correctly (n div by T)
+                 printf("Client %d: Warning - No columns to send to child %d?\n", client_id, child_id);
+                 child_results_vec[i] = NULL; // Ensure it's marked as empty
+                 child_results_size[i] = 0;
             }
-             // Double check the flag (set by the thread)
-             pthread_mutex_lock(&ack_mutex);
-             if (!ack_flags[i]) {
-                  fprintf(stderr, "Client %d: ACK flag not set for child %d even after join.\n", client_id, children_ids[i]);
-                  all_acks_received = false;
-             }
-             pthread_mutex_unlock(&ack_mutex);
+            // Update remaining columns for the next child (or self)
+            current_cols_in_node = cols_to_keep;
+             // The offset remains the same, we only consider the 'upper half' cols now
+        }
+         // The final 'cols_to_keep' are the ones processed by this node itself (covered by p_local)
+         printf("Client %d: Columns for self: %u\n", client_id, current_cols_in_node);
 
-         } else {
-              // If no rows were sent, the ack_flag should be 1.
-             if (!ack_flags[i]) {
-                  fprintf(stderr, "Client %d: ACK flag not set for child %d (no data sent case).\n", client_id, children_ids[i]);
-                 all_acks_received = false;
+
+        // Wait for all child threads to complete (receive results)
+        printf("Client %d: Waiting for results from %d children...\n", client_id, num_children);
+        bool all_child_results_ok = true;
+        for (int i = 0; i < num_children; ++i) {
+             if (child_args[i].matrix_part.cols > 0) { // Only join if thread was created
+                 void *t_ret;
+                 pthread_join(child_threads[i], &t_ret);
+                 if (t_ret != (void*)0) {
+                     fprintf(stderr, "Client %d: Thread for child %d failed.\n", client_id, children_ids[i]);
+                     all_child_results_ok = false;
+                 }
+                  // Check if result was actually received (mutex needed?)
+                 pthread_mutex_lock(&child_result_mutex);
+                 if(child_results_vec[i] == NULL && child_results_size[i] != 0) { // Should not happen
+                      fprintf(stderr, "Client %d: Result size mismatch for child %d\n", client_id, children_ids[i]);
+                     all_child_results_ok = false;
+                 } else if (child_results_vec[i] == NULL && child_args[i].matrix_part.cols > 0) {
+                     fprintf(stderr, "Client %d: Result vector NULL for child %d\n", client_id, children_ids[i]);
+                      all_child_results_ok = false;
+                 }
+                 pthread_mutex_unlock(&child_result_mutex);
              }
-         }
+        }
+        pthread_mutex_destroy(&child_result_mutex);
+
+
+        if (!all_child_results_ok) {
+            fprintf(stderr, "Client %d: Failed to get results from all children. Cannot proceed.\n", client_id);
+             // Free received child results if any
+            for(int i=0; i<num_children; ++i) free(child_results_vec[i]);
+            free(child_results_vec); free(child_results_size); free(child_args); free(child_threads); free(children_ids); free(p_local); free_matrix(&my_matrix_cols); close(conn_fd); free_config(config);
+            exit(EXIT_FAILURE);
+        }
+        printf("Client %d: All child results received.\n", client_id);
+
+        // Combine results: p_local + child_results[0] + child_results[1] + ...
+        // Order matters! It should match the original column order.
+        // p_local corresponds to the *first* `cols_to_keep` columns this node received.
+        // Child results correspond to subsequent blocks.
+        p_combined_size = p_local_size; // Start with own size
+        for(int i=0; i<num_children; ++i) p_combined_size += child_results_size[i];
+
+        printf("Client %d: Combining local vector (size %u) with child vectors. Total size: %u\n", client_id, p_local_size, p_combined_size);
+        p_combined = malloc(p_combined_size * sizeof(double));
+        if (!p_combined) error_exit("Client: Failed malloc for combined vector");
+
+        // 1. Copy p_local (first part)
+        memcpy(p_combined, p_local, p_local_size * sizeof(double));
+        free(p_local); // Free local vector now
+        p_local = NULL;
+        size_t current_offset = p_local_size;
+
+        // 2. Copy child results in *increasing* order of child ID (which corresponds to column order)
+        for (int i = 0; i < num_children; ++i) { // Iterate 0 to num_children-1
+             if (child_results_vec[i]) {
+                 memcpy(p_combined + current_offset, child_results_vec[i], child_results_size[i] * sizeof(double));
+                 current_offset += child_results_size[i];
+                 free(child_results_vec[i]); // Free child vector after copying
+                 child_results_vec[i] = NULL;
+             }
+        }
+
+        // Free management arrays
+        free(child_results_vec);
+        free(child_results_size);
+        free(child_args);
+        free(child_threads);
+
+    } // End internal node processing
+
+    // --- Send Combined Result Vector back to Parent ---
+    printf("Client %d: Sending combined result vector (size %u) back to parent/server (socket %d).\n", client_id, p_combined_size, conn_fd);
+    if (send_vector(conn_fd, p_combined, p_combined_size) != 0) {
+        fprintf(stderr, "Client %d: Failed to send result vector back.\n", client_id);
+        // Error, but continue to cleanup
+    } else {
+        printf("Client %d: Result vector sent successfully.\n", client_id);
     }
 
-    pthread_mutex_destroy(&ack_mutex);
-    free(ack_flags);
-    free(child_args);
-    free(child_threads);
-
-    if (!all_acks_received) {
-        fprintf(stderr, "Client %d: Failed to receive ACKs from all children. Cannot proceed.\n", client_id);
-         free(children_ids);
-         free(my_matrix_part);
-         close(conn_fd);
-         free_config(config);
-         exit(EXIT_FAILURE);
-    }
-    printf("Client %d: All child ACKs received.\n", client_id);
-
-} // End internal node processing
-
-// Send ACK back to parent/server
-printf("Client %d: Sending ACK to parent/server (socket %d).\n", client_id, conn_fd);
-if (send_all(conn_fd, ACK_MSG, ACK_LEN) != 0) {
-    fprintf(stderr, "Client %d: Failed to send ACK to parent/server.\n", client_id);
-    // Error is critical, but try to record time anyway before exiting
-} else {
-     printf("Client %d: ACK sent successfully.\n", client_id);
-}
-
-
-// Record time_after
-gettimeofday(&time_after, NULL);
-printf("Client %d: Finished processing at %ld.%06ld\n", client_id, time_after.tv_sec, time_after.tv_usec);
-
-
-// Calculate and print elapsed time for this client
-double elapsed = time_diff(&time_before, &time_after);
-printf("Client %d: Total time elapsed (accept to ack sent): %.6f seconds\n", client_id, elapsed);
-
-
-// Cleanup
-free(children_ids);
-free(my_matrix_part);
-close(conn_fd);
-free_config(config);
-printf("--- Client %d finished ---\n", client_id);
+    // Cleanup
+    free(p_combined); // Free the final vector sent
+    free(children_ids);
+    free_matrix(&my_matrix_cols); // Free the matrix received initially
+    close(conn_fd);
+    free_config(config);
+    printf("--- Client %d finished ---\n", client_id);
 }
 
 // --- Main ---
 int main(int argc, char *argv[]) {
-if (argc != 3) {
-fprintf(stderr, "Usage:\n");
-fprintf(stderr, " Server: %s <n> 0\n", argv[0]);
-fprintf(stderr, " Client: %s <port> <client_id>\n", argv[0]);
-return EXIT_FAILURE;
-}
-
-long arg1 = strtol(argv[1], NULL, 10);
-long arg2 = strtol(argv[2], NULL, 10);
-
-if (arg1 <= 0) {
-    fprintf(stderr, "Error: First argument must be positive.\n");
-    return EXIT_FAILURE;
-}
- if (arg2 < 0) {
-    fprintf(stderr, "Error: Second argument must be non-negative.\n");
-    return EXIT_FAILURE;
-}
-
-
-if (arg2 == 0) {
-    // Server mode
-    int n = (int)arg1;
-    if (n <= 0) {
-         fprintf(stderr, "Error: Matrix size n must be positive.\n");
+     // Usage: Server: ./program <n> <Q> 0
+     // Usage: Client: ./program <port> <client_id> <Q>
+    if (argc != 4) {
+        fprintf(stderr, "Usage:\n");
+        fprintf(stderr, "  Server: %s <n> <Q> 0\n", argv[0]);
+        fprintf(stderr, "  Client: %s <port> <client_id> <Q>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    run_server(n);
-} else {
-    // Client mode
-    int port = (int)arg1;
-    int client_id = (int)arg2;
-     if (port <= 0 || port > 65535) {
-         fprintf(stderr, "Error: Invalid port number %d.\n", port);
-        return EXIT_FAILURE;
+
+    long arg1 = strtol(argv[1], NULL, 10);
+    long arg2 = strtol(argv[2], NULL, 10);
+    long arg3 = strtol(argv[3], NULL, 10); // Mode (0=server) or Q (client)
+
+
+    if (arg3 == 0) {
+        // Server mode
+        int n = (int)arg1;
+        int q = (int)arg2;
+        if (n <= 0) { fprintf(stderr, "Error: n must be positive.\n"); return EXIT_FAILURE; }
+        if (q <= 0) { fprintf(stderr, "Error: Q must be positive.\n"); return EXIT_FAILURE; }
+        run_server(n, q);
+    } else {
+        // Client mode
+        int port = (int)arg1;
+        int client_id = (int)arg2;
+        int q = (int)arg3; // Q is the third arg for client
+         if (port <= 0 || port > 65535) { fprintf(stderr, "Error: Invalid port.\n"); return EXIT_FAILURE; }
+         if (client_id <= 0) { fprintf(stderr, "Error: Client ID must be positive.\n"); return EXIT_FAILURE; }
+         if (q <= 0) { fprintf(stderr, "Error: Q must be positive.\n"); return EXIT_FAILURE; }
+
+        // Need n from config file for client side validation/output
+        // We read config inside run_client, maybe pass Q there? Yes.
+        run_client(port, client_id, q);
     }
-     if (client_id <= 0) {
-         fprintf(stderr, "Error: Client ID must be positive.\n");
-        return EXIT_FAILURE;
-    }
-    run_client(port, client_id);
+
+    return EXIT_SUCCESS;
 }
 
-return EXIT_SUCCESS;
+
+// --- Helper Implementations (Placeholders - Reuse previous implementations) ---
+
+// Sends exactly 'len' bytes from 'buf' to 'sockfd'. Handles partial sends.
+int send_all(int sockfd, const void *buf, size_t len) {
+    size_t total = 0;
+    ssize_t n;
+    const char *ptr = (const char *)buf;
+    while (total < len) {
+        n = send(sockfd, ptr + total, len - total, 0);
+        if (n == -1) { if (errno == EINTR) continue; perror("send"); return -1; }
+        if (n == 0) { fprintf(stderr, "send: connection closed\n"); return -1; }
+        total += n;
+    }
+    return 0; // Success
+}
+
+// Receives exactly 'len' bytes into 'buf' from 'sockfd'. Handles partial receives.
+int recv_all(int sockfd, void *buf, size_t len) {
+    size_t total = 0;
+    ssize_t n;
+    char *ptr = (char *)buf;
+    while (total < len) {
+        n = recv(sockfd, ptr + total, len - total, 0);
+        if (n == -1) { if (errno == EINTR) continue; perror("recv"); return -1; }
+        if (n == 0) { fprintf(stderr, "recv: connection closed\n"); return -1; }
+        total += n;
+    }
+    return 0; // Success
+}
+
+// Find the 0-based position of the least significant bit set to 1
+int find_lsb_pos(int n) {
+    if (n <= 0) return -1; // Handle 0 or negative
+    int pos = 0;
+    while ((n & 1) == 0) {
+        n >>= 1;
+        pos++;
+        if (pos > 30) return -1; // Safety break
+    }
+    return pos;
+}
+
+// Find the parent client ID
+int find_parent(int client_id, int total_clients) {
+     if (total_clients <= 1 || (total_clients & (total_clients - 1)) != 0) return -1; // Invalid T
+    int half_clients = total_clients / 2;
+    int base, relative_id;
+
+    if (client_id >= 1 && client_id <= half_clients) { base = 1; }
+    else if (client_id > half_clients && client_id <= total_clients) { base = half_clients + 1; }
+    else { return -1; } // Invalid client_id
+
+    relative_id = client_id - base;
+    if (relative_id == 0) return 0; // Root node, parent is server
+
+    int lsb_pos_rel = find_lsb_pos(relative_id);
+    if (lsb_pos_rel < 0) return -1; // Error finding LSB
+
+    return client_id - (1 << lsb_pos_rel);
+}
+
+// Find children client IDs. Returns a dynamically allocated array terminated by 0.
+int* find_children(int client_id, int total_clients) {
+    if (total_clients <= 1 || (total_clients & (total_clients - 1)) != 0) return NULL;
+    int half_clients = total_clients / 2;
+    int base, tree_max_id;
+
+    if (client_id >= 1 && client_id <= half_clients) { base = 1; tree_max_id = half_clients; }
+    else if (client_id > half_clients && client_id <= total_clients) { base = half_clients + 1; tree_max_id = total_clients; }
+    else { return NULL; }
+
+    int *children = malloc(sizeof(int) * (total_clients + 1));
+    if (!children) { perror("malloc children"); return NULL; }
+    int child_count = 0;
+
+    for (int i = 0; ; ++i) {
+        int power_of_2 = 1 << i;
+        if (client_id > INT_MAX - power_of_2) break; // Avoid overflow check
+        int potential_child_id = client_id + power_of_2;
+
+        if (potential_child_id > tree_max_id) break;
+
+        int parent_check = find_parent(potential_child_id, total_clients);
+        if (parent_check == client_id) {
+            children[child_count++] = potential_child_id;
+        } else if (parent_check == -1) { free(children); return NULL; } // Error
+         if (i >= 30) break; // Safety
+    }
+    children[child_count] = 0;
+    return children;
+}
+
+// Config Reader (Added n, q args, primarily for client output)
+Config* read_config(const char *filename, int n_arg, int q_arg) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) { perror("fopen config.txt"); return NULL; }
+
+    Config *config = malloc(sizeof(Config));
+    if (!config) { perror("malloc config"); fclose(fp); return NULL; }
+    config->clients = NULL;
+    config->n = n_arg; // Store n from command line (server) or 0 (client)
+    config->q = q_arg; // Store q from command line
+
+    if (fscanf(fp, "%d\n", &config->total_clients) != 1 || config->total_clients <= 0 || config->total_clients > MAX_CLIENTS) {
+        fprintf(stderr, "Invalid T in config file.\n"); fclose(fp); free(config); return NULL;
+    }
+     // Power of 2 check done in server/client main logic now
+
+    config->clients = malloc(sizeof(ClientInfo) * config->total_clients);
+    if (!config->clients) { perror("malloc clients array"); fclose(fp); free(config); return NULL; }
+
+    for (int i = 0; i < config->total_clients; ++i) {
+        config->clients[i].id = i + 1;
+        if (fscanf(fp, "%s %d\n", config->clients[i].ip, &config->clients[i].port) != 2) {
+            fprintf(stderr, "Error reading client %d info.\n", i + 1);
+            fclose(fp); free(config->clients); free(config); return NULL;
+        }
+        // Basic IP/Port validation (reuse from previous version)
+        struct sockaddr_in sa;
+        if (config->clients[i].port <= 0 || config->clients[i].port > 65535 || inet_pton(AF_INET, config->clients[i].ip, &(sa.sin_addr)) != 1) {
+             fprintf(stderr, "Invalid IP/Port for client %d\n", i+1); fclose(fp); free(config->clients); free(config); return NULL;
+        }
+    }
+    fclose(fp);
+    // If client called, try to find N from somewhere? Assume server passes it implicitly via matrix dims.
+    // Client needs N for Table 2 output. It gets it from received matrix rows.
+    // Let's update config->n inside run_client after receiving matrix.
+    printf("Successfully read config for %d clients.\n", config->total_clients);
+    return config;
+}
+
+void free_config(Config *config) {
+    if (config) {
+        free(config->clients);
+        free(config);
+    }
 }
