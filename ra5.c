@@ -19,6 +19,7 @@
 #define MAX_CLIENTS 256
 #define MAX_PRINT_DIM 5
 #define Q_PARAM 3               // Order for Moving Average computation
+#define MAX_RAND_INT 1000       // Upper bound (exclusive) for random integers in matrix, e.g. 1 to 999
 
 // Structures
 typedef struct {
@@ -57,7 +58,7 @@ typedef struct {
 
 typedef struct {
     int thread_idx_in_comp_pool; // For logging or other purposes
-    int core_to_pin;             // <<<<<<< FIXED: Added core_to_pin member
+    int core_to_pin;
 
     const int* input_matrix_rows_ptr;
     int num_rows_for_this_thread;
@@ -71,7 +72,7 @@ typedef struct {
 // Globals
 ClientInfo g_all_clients[MAX_CLIENTS];
 int g_total_clients_t = 0;
-long g_num_cores = 1; // Changed to long for sysconf compatibility, will be cast if needed
+long g_num_cores = 1;
 
 
 // Utility Functions
@@ -153,17 +154,22 @@ int read_config(const char* filename) {
     return 0;
 }
 
+// MODIFIED: generate_matrix to produce random positive integers
 int* generate_matrix(int n_val) {
     if (n_val <= 0) return NULL;
     size_t num_elements = (size_t)n_val * (size_t)n_val;
     int* matrix = (int*)malloc(num_elements * sizeof(int));
     if (!matrix) { perror("Failed to allocate matrix"); return NULL; }
-    for (int i = 0; i < n_val; ++i) {
-        for (int j = 0; j < n_val; ++j) {
-            matrix[(size_t)i * (size_t)n_val + j] = (i * n_val + j) % 100; // Values 0-99 for computation
-        }
+
+    // srand() should ideally be called once, e.g., in main or at the start of server_mode
+    // For simplicity here, if server_mode is the only place generating, it's okay.
+    // If generate_matrix could be called multiple times rapidly, move srand out.
+
+    for (size_t i = 0; i < num_elements; ++i) {
+        // rand() % MAX_RAND_INT gives 0 to MAX_RAND_INT-1. Add 1 for 1 to MAX_RAND_INT.
+        matrix[i] = (rand() % MAX_RAND_INT) + 1;
     }
-    printf("Generated %dx%d matrix.\n", n_val, n_val);
+    printf("Generated %dx%d matrix with random positive integers (1 to %d).\n", n_val, n_val, MAX_RAND_INT);
     return matrix;
 }
 
@@ -301,14 +307,17 @@ void* server_root_comm_thread(void* args) {
 }
 
 void server_mode(int n_val) {
-    if (g_total_clients_t < 2 && g_total_clients_t != 0) { // Allow t=0 if config read fails and is handled
+    // Seed the random number generator ONCE for this server instance
+    srand(time(NULL)); // Uses current time as seed
+
+    if (g_total_clients_t < 2 && g_total_clients_t != 0) {
          fprintf(stderr, "Server: Requires at least 2 clients for the specified two-tree distribution logic.\n");
          return;
-    } else if (g_total_clients_t == 0){ // Should be caught by main
+    } else if (g_total_clients_t == 0){
         fprintf(stderr, "Server: No clients configured.\n"); return;
     }
 
-    int* matrix = generate_matrix(n_val);
+    int* matrix = generate_matrix(n_val); // Now uses rand()
     if (!matrix) return;
 
     double* overall_result_vector = (double*)malloc((size_t)n_val * sizeof(double));
@@ -328,7 +337,7 @@ void server_mode(int n_val) {
     args1->matrix_data_segment = matrix;
     args1->rows_to_send = n_val / 2;
     args1->n_cols = n_val;
-    args1->result_storage_location = overall_result_vector; // First half
+    args1->result_storage_location = overall_result_vector;
     args1->expected_num_results = args1->rows_to_send;
     args1->server_results_received_count = &server_results_received_count;
     args1->server_results_mutex = &server_results_mutex;
@@ -343,7 +352,7 @@ void server_mode(int n_val) {
     args2->matrix_data_segment = matrix + (size_t)(n_val / 2) * (size_t)n_val;
     args2->rows_to_send = n_val - (n_val / 2);
     args2->n_cols = n_val;
-    args2->result_storage_location = overall_result_vector + (n_val / 2); // Second half
+    args2->result_storage_location = overall_result_vector + (n_val / 2);
     args2->expected_num_results = args2->rows_to_send;
     args2->server_results_received_count = &server_results_received_count;
     args2->server_results_mutex = &server_results_mutex;
@@ -379,26 +388,19 @@ void server_mode(int n_val) {
 void* client_compute_do_work_task(void* args) {
     ClientComputeDoWorkThreadArgs* task_args = (ClientComputeDoWorkThreadArgs*)args;
 
-    // Set CPU affinity
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(task_args->core_to_pin, &cpuset); // Use core_to_pin passed in args
+    CPU_SET(task_args->core_to_pin, &cpuset);
     if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
-        // Non-fatal, but log it. Might not be supported or permissions issue.
         fprintf(stderr, "Client: Warning - pthread_setaffinity_np failed for computation thread %d on core %d: %s. Continuing without affinity.\n",
                 task_args->thread_idx_in_comp_pool, task_args->core_to_pin, strerror(errno));
     }
-    // Optional: Verify core
-    // printf("Client computation thread %d (for rows of client) attempting pin to core %d, actually on core %d\n",
-    //        task_args->thread_idx_in_comp_pool, task_args->core_to_pin, sched_getcpu());
-
 
     for (int i = 0; i < task_args->num_rows_for_this_thread; ++i) {
         const int* current_row_ptr = task_args->input_matrix_rows_ptr + (i * (size_t)task_args->n_cols);
         task_args->output_results_for_these_rows[i] =
             do_row_computation(current_row_ptr, task_args->n_cols, task_args->q_param_val);
     }
-
     free(task_args);
     return NULL;
 }
@@ -448,7 +450,7 @@ void* client_child_handler_thread(void* args) {
     if (num_results_from_child != thread_args->rows_to_send_to_child) {
          fprintf(stderr, "Client %d: Mismatch in expected results from child %d. Expected %d, Got %d.\n",
                 thread_args->sender_client_global_id, target_child_info->id, thread_args->rows_to_send_to_child, num_results_from_child);
-        *(thread_args->child_processed_flag) = -1; // Treat as error
+        *(thread_args->child_processed_flag) = -1;
     }
 
     if (num_results_from_child > 0 && *(thread_args->child_processed_flag) != -1) {
@@ -458,13 +460,11 @@ void* client_child_handler_thread(void* args) {
             *(thread_args->child_processed_flag) = -1;
         } else {
             printf("Client %d: Results received from child %d.\n", thread_args->sender_client_global_id, target_child_info->id);
-            *(thread_args->child_processed_flag) = 1; // Success
+            *(thread_args->child_processed_flag) = 1;
         }
     } else if (num_results_from_child == 0 && *(thread_args->child_processed_flag) != -1) {
-        // If 0 rows were sent (e.g. child is a leaf of a leaf in some sense), 0 results is valid.
         *(thread_args->child_processed_flag) = 1;
     }
-
 
     close(sock_fd);
     free(thread_args);
@@ -493,7 +493,7 @@ void client_mode(int my_listen_port, int my_global_id) {
     printf("Client %d: Accepted connection from parent/server %s:%d\n", my_global_id, inet_ntoa(parent_addr.sin_addr), ntohs(parent_addr.sin_port));
     close(listen_fd);
 
-    int R_incoming, N_original_cols; // Rows and Columns received
+    int R_incoming, N_original_cols;
     if (recv_all(parent_conn_fd, &R_incoming, sizeof(int)) <= 0) { close(parent_conn_fd); return; }
     if (recv_all(parent_conn_fd, &N_original_cols, sizeof(int)) <= 0) { close(parent_conn_fd); return; }
     printf("Client %d: Receiving matrix of %d x %d\n", my_global_id, R_incoming, N_original_cols);
@@ -503,7 +503,6 @@ void client_mode(int my_listen_port, int my_global_id) {
     if (recv_all(parent_conn_fd, received_matrix_data, received_data_size) <= 0) {
         free(received_matrix_data); close(parent_conn_fd); return;
     }
-   // print_matrix_portion_int("Client received", received_matrix_data, R_incoming, N_original_cols, MAX_PRINT_DIM);
 
     double* final_results_for_parent = (double*)malloc((size_t)R_incoming * sizeof(double));
     if(!final_results_for_parent) { perror("Client: Malloc for final_results_for_parent failed"); free(received_matrix_data); close(parent_conn_fd); return; }
@@ -513,50 +512,38 @@ void client_mode(int my_listen_port, int my_global_id) {
 
     pthread_t* child_handler_threads = NULL;
     int* child_processed_flags = NULL;
-    int R_local = R_incoming; // Rows this client will process locally
-    int* current_matrix_segment_ptr_for_dist = received_matrix_data; // Pointer to the current upper block
-    size_t current_child_result_offset = 0; // Offset into final_results_for_parent for child results
+    int R_local = R_incoming;
+    int* current_matrix_segment_ptr_for_dist = received_matrix_data;
+    size_t current_child_result_offset = 0;
 
-    // Calculate R_local first (rows client keeps for itself)
     int temp_R_local_calc = R_incoming;
     for(int i=0; i < num_children; ++i) temp_R_local_calc /= 2;
     R_local = temp_R_local_calc;
-
-    // Children results will be placed *after* the local results in the final_results_for_parent array.
     current_child_result_offset = (size_t)R_local;
-
 
     if (num_children > 0) {
         printf("Client %d: Has %d children. Distributing matrix and preparing for results...\n", my_global_id, num_children);
         child_handler_threads = (pthread_t*)malloc(num_children * sizeof(pthread_t));
-        // Check child_handler_threads first
         if (!child_handler_threads) {
             perror("Client: Malloc for child_handler_threads failed");
-            free(received_matrix_data); 
-            free(final_results_for_parent); 
-            close(parent_conn_fd);
-            return; // Exit function
+            free(received_matrix_data); free(final_results_for_parent); close(parent_conn_fd);
+            return;
         }
-
         child_processed_flags = (int*)calloc(num_children, sizeof(int));
-        if (!child_processed_flags) { // Then check child_processed_flags
+        if (!child_processed_flags) {
             perror("Client: Calloc for child_processed_flags failed");
-            free(received_matrix_data); 
-            free(final_results_for_parent); 
-            close(parent_conn_fd);
-            free(child_handler_threads); // Free the previously successful malloc
-            return; // Exit function
+            free(received_matrix_data); free(final_results_for_parent); close(parent_conn_fd);
+            free(child_handler_threads);
+            return;
         }
-        // Both allocations succeeded
 
-        int rows_for_distribution_iter = R_incoming; // Tracks remaining rows in current block for distribution
-        for (int i = 0; i < num_children; ++i) { // Children are in "furthest first" order
+        int rows_for_distribution_iter = R_incoming;
+        for (int i = 0; i < num_children; ++i) {
             int rows_for_this_child = rows_for_distribution_iter / 2;
-            // Data for child is the lower half of the current_matrix_segment_ptr_for_dist
             int* data_ptr_for_this_child = current_matrix_segment_ptr_for_dist + (size_t)(rows_for_distribution_iter / 2) * (size_t)N_original_cols;
 
             ClientChildHandlerThreadArgs* child_args = (ClientChildHandlerThreadArgs*)malloc(sizeof(ClientChildHandlerThreadArgs));
-            if(!child_args) { perror("Client: Malloc child_args failed"); child_processed_flags[i] = -1; continue; } // Skip this child if alloc fails
+            if(!child_args) { perror("Client: Malloc child_args failed"); child_processed_flags[i] = -1; continue; }
 
             child_args->sender_client_global_id = my_global_id;
             child_args->child_global_id = children_global_ids[i];
@@ -569,48 +556,45 @@ void client_mode(int my_listen_port, int my_global_id) {
             if (pthread_create(&child_handler_threads[i], NULL, client_child_handler_thread, child_args) != 0) {
                 perror("Client: Failed to create child_handler_thread"); free(child_args); child_processed_flags[i] = -1;
             }
-            current_child_result_offset += rows_for_this_child; // Advance offset for next child's results
-            rows_for_distribution_iter /= 2; // Client retains upper half for next step
-            // current_matrix_segment_ptr_for_dist *remains the same* because we are always taking the upper half of the current block for "self"
+            current_child_result_offset += rows_for_this_child;
+            rows_for_distribution_iter /= 2;
         }
     }
     printf("Client %d: Will process %d rows locally (matrix portion starts at received_matrix_data).\n", my_global_id, R_local);
 
-    // --- Computation Phase ---
     struct timespec time_before_computation, time_after_computation;
     clock_gettime(CLOCK_MONOTONIC, &time_before_computation);
 
     if (R_local > 0) {
         int num_comp_threads = (R_local < g_num_cores) ? R_local : (int)g_num_cores;
-        if (num_comp_threads <= 0 && R_local > 0) num_comp_threads = 1; // Ensure at least one thread if rows > 0
+        if (num_comp_threads <= 0 && R_local > 0) num_comp_threads = 1;
 
         pthread_t* compute_threads = NULL;
         if (num_comp_threads > 0) {
             compute_threads = (pthread_t*)malloc(num_comp_threads * sizeof(pthread_t));
-            if (!compute_threads) { perror("Client: Malloc compute_threads failed"); /* Handle error */ }
+            if (!compute_threads) { perror("Client: Malloc compute_threads failed"); /* Critical error, consider exiting */ }
         }
 
         int current_row_offset_for_comp = 0;
         for (int i = 0; i < num_comp_threads; ++i) {
+            if (!compute_threads) break; // Malloc failed, can't create threads
             ClientComputeDoWorkThreadArgs* comp_args = (ClientComputeDoWorkThreadArgs*)malloc(sizeof(ClientComputeDoWorkThreadArgs));
             if (!comp_args) { perror("Client: Malloc comp_args failed"); continue; }
 
             comp_args->thread_idx_in_comp_pool = i;
-            comp_args->core_to_pin = i % (int)g_num_cores; // Simple core mapping
+            comp_args->core_to_pin = i % (int)g_num_cores;
 
             int rows_for_this_comp_thread = R_local / num_comp_threads;
             if (i < R_local % num_comp_threads) rows_for_this_comp_thread++;
 
-            // Local data is always the first R_local rows of received_matrix_data
             comp_args->input_matrix_rows_ptr = received_matrix_data + (size_t)current_row_offset_for_comp * (size_t)N_original_cols;
             comp_args->num_rows_for_this_thread = rows_for_this_comp_thread;
             comp_args->n_cols = N_original_cols;
             comp_args->q_param_val = Q_PARAM;
-            // Local results are stored at the beginning of final_results_for_parent
             comp_args->output_results_for_these_rows = final_results_for_parent + current_row_offset_for_comp;
 
             if (pthread_create(&compute_threads[i], NULL, client_compute_do_work_task, comp_args) != 0) {
-                perror("Client: Failed to create compute thread"); free(comp_args); compute_threads[i] = 0; // Mark as not created
+                perror("Client: Failed to create compute thread"); free(comp_args); compute_threads[i] = 0;
             }
             current_row_offset_for_comp += rows_for_this_comp_thread;
         }
@@ -623,12 +607,11 @@ void client_mode(int my_listen_port, int my_global_id) {
     long long elapsed_ms_computation = timespec_diff_ms(&time_before_computation, &time_after_computation);
     printf("Client %d: Computation time: %lld ms for %d local rows.\n", my_global_id, elapsed_ms_computation, R_local);
 
-    // Wait for child handler threads to complete (i.e., all results from children received)
     if (num_children > 0 && child_handler_threads) {
         int all_children_ok = 1;
         for (int i = 0; i < num_children; ++i) {
-            if (child_handler_threads[i]) pthread_join(child_handler_threads[i], NULL); // Join if thread was created
-            if (child_processed_flags && child_processed_flags[i] != 1) { // Check flag if array exists
+            if (child_handler_threads[i]) pthread_join(child_handler_threads[i], NULL);
+            if (child_processed_flags && child_processed_flags[i] != 1) {
                 fprintf(stderr, "Client %d: Child %d (global ID %d) did not process successfully (flag=%d).\n", my_global_id, i, children_global_ids[i], child_processed_flags[i]);
                 all_children_ok = 0;
             }
@@ -637,12 +620,10 @@ void client_mode(int my_listen_port, int my_global_id) {
         else printf("Client %d: Errors encountered with some children.\n", my_global_id);
     }
 
-    // Send aggregated results to parent
     printf("Client %d: Sending %d results to parent/server.\n", my_global_id, R_incoming);
-   // print_vector_double("Client sending to parent", final_results_for_parent, R_incoming, MAX_PRINT_DIM);
-    if (send_all(parent_conn_fd, &R_incoming, sizeof(int)) <= 0) { /* handle error */ }
+    if (send_all(parent_conn_fd, &R_incoming, sizeof(int)) <= 0) { fprintf(stderr, "Client %d: Error sending result count\n", my_global_id); }
     if (R_incoming > 0) {
-      if (send_all(parent_conn_fd, final_results_for_parent, (size_t)R_incoming * sizeof(double)) <= 0) { /* handle error */ }
+      if (send_all(parent_conn_fd, final_results_for_parent, (size_t)R_incoming * sizeof(double)) <= 0) { fprintf(stderr, "Client %d: Error sending result data\n", my_global_id); }
     }
 
     close(parent_conn_fd);
@@ -664,7 +645,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     g_num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (g_num_cores < 1) g_num_cores = 1; // Safety
+    if (g_num_cores < 1) g_num_cores = 1;
     printf("System has %ld CPU cores available.\n", g_num_cores);
 
     int arg1 = atoi(argv[1]); int arg2 = atoi(argv[2]);
@@ -672,11 +653,11 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Fatal: Failed to read configuration file %s. Exiting.\n", CONFIG_FILE); return 1;
     }
 
-    if (arg2 == 0) { // Server mode
+    if (arg2 == 0) {
         if (arg1 <= 0) { fprintf(stderr, "Server mode: Matrix size n must be positive.\n"); return 1; }
         printf("Starting in SERVER mode. Matrix size: %d\n", arg1);
         server_mode(arg1);
-    } else if (arg2 > 0) { // Client mode
+    } else if (arg2 > 0) {
         if (arg1 <= 0 || arg1 > 65535) { fprintf(stderr, "Client mode: Port must be between 1 and 65535.\n"); return 1; }
         if (arg2 <= 0 || arg2 > g_total_clients_t) {
              fprintf(stderr, "Client mode: Client ID %d is invalid for %d total clients.\n", arg2, g_total_clients_t); return 1;
