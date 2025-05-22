@@ -324,7 +324,6 @@ void server_mode(int n_val) {
     if(!overall_result_vector) { perror("Server: Failed to allocate overall_result_vector"); free(matrix); return; }
 
     struct timespec time_before, time_after;
-    clock_gettime(CLOCK_MONOTONIC, &time_before);
 
     pthread_t threads[2];
     int server_results_received_count = 0;
@@ -342,6 +341,10 @@ void server_mode(int n_val) {
     args1->server_results_received_count = &server_results_received_count;
     args1->server_results_mutex = &server_results_mutex;
     args1->server_results_cond = &server_results_cond;
+    
+    // Capture time_before just before distributing matrix to slave processes
+    clock_gettime(CLOCK_MONOTONIC, &time_before);
+    
     if (pthread_create(&threads[0], NULL, server_root_comm_thread, args1) != 0) {
         perror("Server: Failed to create thread for client 1"); free(args1); free(matrix); free(overall_result_vector); return;
     }
